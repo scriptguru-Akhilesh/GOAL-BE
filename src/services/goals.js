@@ -27,17 +27,51 @@ function parseTimelineMonths(timeline) {
   return match ? parseInt(match[1], 10) : 6;
 }
 
+function normalizePriority(priority) {
+  const value = String(priority || '').toLowerCase();
+  if (['low', 'medium', 'high'].includes(value)) {
+    return value;
+  }
+  return 'medium';
+}
+
 function extractTasksFromRoadmap(roadmap) {
   const tasks = [];
-  const months = roadmap?.months || [];
+  const days = Array.isArray(roadmap?.days) ? roadmap.days : [];
 
+  if (days.length > 0) {
+    days.forEach((day, index) => {
+      tasks.push({
+        dayIndex: Number(day?.day) || index + 1,
+        title:
+          typeof day?.title === 'string' && day.title.trim()
+            ? day.title.trim()
+            : `Day ${index + 1}`,
+        description:
+          typeof day?.description === 'string' && day.description.trim()
+            ? day.description.trim()
+            : '',
+        durationMinutes: Math.max(15, Number(day?.durationMinutes) || 60),
+        priority: normalizePriority(day?.priority),
+        dependsOn: Array.isArray(day?.dependsOn) ? day.dependsOn : [],
+      });
+    });
+    return tasks;
+  }
+
+  const months = roadmap?.months || [];
   months.forEach((month, monthIndex) => {
     const weeks = month.weeks || [];
     weeks.forEach((week, weekIndex) => {
       const weekTasks = week.tasks || [];
-      weekTasks.forEach((title) => {
+      weekTasks.forEach((title, taskIndex) => {
         tasks.push({
+          dayIndex: tasks.length + 1,
           title: typeof title === 'string' ? title : String(title),
+          description: `Task ${taskIndex + 1} for ${month.title || `month ${monthIndex + 1}`}`,
+          durationMinutes: 60,
+          priority: 'medium',
+          dependsOn: [],
           monthIndex: monthIndex + 1,
           weekIndex: weekIndex + 1,
         });
@@ -62,10 +96,15 @@ function mapTask(t) {
   return {
     id: t._id.toString(),
     title: t.title,
+    description: t.description || '',
+    durationMinutes: t.durationMinutes || 60,
+    priority: t.priority || 'medium',
     status: t.status,
     dueDate: t.dueDate,
+    dayIndex: t.dayIndex,
     monthIndex: t.monthIndex,
     weekIndex: t.weekIndex,
+    startedAt: t.startedAt ? new Date(t.startedAt).toISOString() : null,
   };
 }
 
@@ -74,36 +113,154 @@ function daysBetween(from, to) {
   return Math.max(0, Math.ceil(ms / (1000 * 60 * 60 * 24)));
 }
 
+async function shiftPendingTasks(goalId, fromDate, days, excludeTaskId = null) {
+  if (!days) {
+    return;
+  }
+
+  const db = getDb();
+  const tasks = await db.collection('tasks').find({
+    goalId,
+    status: { $in: ['pending', 'in_progress'] },
+  }).toArray();
+
+  const updates = tasks.filter((task) => {
+    if (excludeTaskId && task._id.equals(excludeTaskId)) {
+      return false;
+    }
+    return !fromDate || (task.dueDate && task.dueDate > fromDate);
+  });
+
+  await Promise.all(
+    updates.map((task) =>
+      db.collection('tasks').updateOne(
+        { _id: task._id },
+        {
+          $set: {
+            dueDate: formatDate(addDays(new Date(task.dueDate), days)),
+            dayIndex: (task.dayIndex || 0) + days,
+          },
+        }
+      )
+    )
+  );
+}
+
+async function setActiveTask({ goal, task }) {
+  const db = getDb();
+  const activeTask = await db.collection('tasks').findOne({
+    goalId: goal._id,
+    status: 'in_progress',
+  });
+
+  if (activeTask && !activeTask._id.equals(task._id)) {
+    await db.collection('tasks').updateOne(
+      { _id: activeTask._id },
+      { $set: { status: 'pending' } }
+    );
+  }
+
+  await db.collection('tasks').updateOne(
+    { _id: task._id },
+    {
+      $set: {
+        status: 'in_progress',
+        startedAt: new Date(),
+      },
+    }
+  );
+
+  await db.collection('goals').updateOne(
+    { _id: goal._id },
+    {
+      $set: {
+        activeTaskId: task._id,
+        activeTaskStartedAt: new Date(),
+      },
+    }
+  );
+
+  return db.collection('tasks').findOne({ _id: task._id });
+}
+
 async function saveGoal({ goal, roadmap }) {
   const db = getDb();
   const userId = await getDefaultUserId();
-  const months = roadmap?.months?.length || parseTimelineMonths(6);
-  const targetDate = addDays(new Date(), months * 30);
+  const existingGoal = await getActiveGoal();
 
-  const goalResult = await db.collection('goals').insertOne({
-    userId,
-    goal,
-    roadmap,
-    progress: 0,
-    confidence: 80,
-    delayDays: 0,
-    streak: 0,
-    targetDate: formatDate(targetDate),
-    createdAt: new Date(),
-  });
-
-  const goalId = goalResult.insertedId;
+  let goalId;
   const taskRows = extractTasksFromRoadmap(roadmap);
-  const daysPerTask = Math.max(1, Math.floor((months * 30) / Math.max(taskRows.length, 1)));
+  const months = Array.isArray(roadmap?.months) && roadmap.months.length > 0
+    ? roadmap.months.length
+    : parseTimelineMonths(6);
+  const totalGoalDays = Math.max(months * 30, taskRows.length || 1);
+  const targetDate = addDays(new Date(), totalGoalDays);
+
+  if (existingGoal) {
+    const existingTaskIds = await db
+      .collection('tasks')
+      .find({ goalId: existingGoal._id }, { projection: { _id: 1 } })
+      .toArray();
+    const taskIds = existingTaskIds.map((task) => task._id);
+
+    if (taskIds.length > 0) {
+      await Promise.all([
+        db.collection('checkins').deleteMany({ taskId: { $in: taskIds } }),
+        db.collection('interviews').deleteMany({ taskId: { $in: taskIds } }),
+        db.collection('tasks').deleteMany({ goalId: existingGoal._id }),
+      ]);
+    }
+
+    await db.collection('goals').updateOne(
+      { _id: existingGoal._id },
+      {
+        $set: {
+          userId,
+          goal,
+          roadmap,
+          activeTaskId: null,
+          activeTaskStartedAt: null,
+          progress: 0,
+          confidence: 80,
+          delayDays: 0,
+          streak: 0,
+          targetDate: formatDate(targetDate),
+          createdAt: new Date(),
+        },
+      }
+    );
+    goalId = existingGoal._id;
+  } else {
+    const goalResult = await db.collection('goals').insertOne({
+      userId,
+      goal,
+      roadmap,
+      activeTaskId: null,
+      activeTaskStartedAt: null,
+      progress: 0,
+      confidence: 80,
+      delayDays: 0,
+      streak: 0,
+      targetDate: formatDate(targetDate),
+      createdAt: new Date(),
+    });
+
+    goalId = goalResult.insertedId;
+  }
 
   if (taskRows.length > 0) {
     const tasks = taskRows.map((row, i) => ({
       goalId,
       title: row.title,
+      description: row.description,
+      durationMinutes: row.durationMinutes,
+      priority: row.priority,
       monthIndex: row.monthIndex,
       weekIndex: row.weekIndex,
+      dayIndex: row.dayIndex || i + 1,
       status: 'pending',
-      dueDate: formatDate(addDays(new Date(), (i + 1) * daysPerTask)),
+      dueDate: formatDate(addDays(new Date(), i)),
+      startedAt: null,
       createdAt: new Date(),
     }));
     await db.collection('tasks').insertMany(tasks);
@@ -184,7 +341,7 @@ async function recalculate({ completedTasks = [], missedTasks = [] }) {
     );
   }
 
-  const delayDays = missedTasks.length * 2;
+  const delayDays = missedTasks.length;
   const newDelayDays = goal.delayDays + delayDays;
   const confidence = Math.max(
     0,
@@ -221,6 +378,10 @@ async function recalculate({ completedTasks = [], missedTasks = [] }) {
     }
   );
 
+  if (delayDays > 0) {
+    await shiftPendingTasks(goal._id, formatDate(new Date()), delayDays);
+  }
+
   const message =
     missedTasks.length > 0
       ? `Skipping today's task delayed goal by ${delayDays} day${delayDays === 1 ? '' : 's'}`
@@ -255,6 +416,13 @@ async function applyVerificationResult({ taskId, answer, status, confidence, sou
   if (task) {
     const goal = await db.collection('goals').findOne({ _id: task.goalId });
     if (goal) {
+      if (taskStatus === 'completed' && goal.activeTaskId && goal.activeTaskId.toString && goal.activeTaskId.toString() === objectId.toString()) {
+        await db.collection('goals').updateOne(
+          { _id: goal._id },
+          { $set: { activeTaskId: null, activeTaskStartedAt: null } }
+        );
+      }
+
       const completed = await db.collection('tasks').countDocuments({
         goalId: goal._id,
         status: 'completed',
@@ -302,6 +470,7 @@ async function getGoalDetails() {
       confidence: 0,
       delayDays: 0,
       streak: 0,
+      activeTaskId: null,
       createdAt: null,
     };
   }
@@ -314,6 +483,7 @@ async function getGoalDetails() {
     confidence: goal.confidence,
     delayDays: goal.delayDays,
     streak: goal.streak,
+    activeTaskId: goal.activeTaskId ? goal.activeTaskId.toString() : null,
     createdAt: goal.createdAt ? goal.createdAt.toISOString() : null,
   };
 }
@@ -323,25 +493,26 @@ async function getTodayTasks() {
   const today = formatDate(new Date());
 
   if (!goal) {
-    return { date: today, tasks: [], overdueCount: 0, dueTodayCount: 0 };
+    return { date: today, tasks: [], overdueCount: 0, dueTodayCount: 0, activeTaskId: null };
   }
 
   const db = getDb();
   const allTasks = await db
     .collection('tasks')
-    .find({ goalId: goal._id, status: 'pending' })
+    .find({ goalId: goal._id, status: { $in: ['pending', 'in_progress', 'completed'] } })
     .sort({ dueDate: 1 })
     .toArray();
 
-  const overdue = allTasks.filter((t) => t.dueDate && t.dueDate < today);
+  const overdue = allTasks.filter((t) => t.dueDate && t.dueDate < today && t.status !== 'completed');
   const dueToday = allTasks.filter((t) => t.dueDate === today);
-  const tasks = [...overdue, ...dueToday.filter((t) => !overdue.find((o) => o._id.equals(t._id)))];
+  const tasks = allTasks.filter((task) => task.dueDate === today || task.status === 'in_progress');
 
   return {
     date: today,
     tasks: tasks.map(mapTask),
     overdueCount: overdue.length,
     dueTodayCount: dueToday.length,
+    activeTaskId: goal.activeTaskId ? goal.activeTaskId.toString() : null,
   };
 }
 
@@ -476,14 +647,7 @@ async function skipTask({ taskId }) {
   };
 }
 
-async function getCoachStats() {
-  const dashboard = await getDashboard();
-  const today = await getTodayTasks();
-  const summary = await getSummary();
-  return { ...dashboard, ...summary, todayTasks: today.tasks.map((t) => t.title) };
-}
-
-async function submitCheckin({ taskId, answer, evaluateCheckin }) {
+async function activateTask({ taskId }) {
   const db = getDb();
   let objectId;
   try {
@@ -501,18 +665,167 @@ async function submitCheckin({ taskId, answer, evaluateCheckin }) {
     throw err;
   }
 
-  const { status, confidence } = await evaluateCheckin({
+  if (task.status === 'completed') {
+    const err = new Error('Cannot activate a completed task');
+    err.status = 400;
+    throw err;
+  }
+
+  const goal = await db.collection('goals').findOne({ _id: task.goalId });
+  if (!goal) {
+    const err = new Error('Active goal not found');
+    err.status = 404;
+    throw err;
+  }
+
+  await setActiveTask({ goal, task });
+
+  return {
+    success: true,
+    taskId: objectId.toString(),
+    startedAt: new Date().toISOString(),
+  };
+}
+
+async function getCoachStats() {
+  const dashboard = await getDashboard();
+  const today = await getTodayTasks();
+  const summary = await getSummary();
+  return { ...dashboard, ...summary, todayTasks: today.tasks.map((t) => t.title) };
+}
+
+async function submitCheckin({ taskId, answer, answers, evaluateCheckin }) {
+  const db = getDb();
+  let objectId;
+  try {
+    objectId = new ObjectId(taskId);
+  } catch {
+    const err = new Error('Invalid taskId');
+    err.status = 400;
+    throw err;
+  }
+
+  const task = await db.collection('tasks').findOne({ _id: objectId });
+  if (!task) {
+    const err = new Error('Task not found');
+    err.status = 404;
+    throw err;
+  }
+
+  const evaluation = await evaluateCheckin({
     taskTitle: task.title,
-    answer,
+    answers: answers || answer,
   });
 
-  return applyVerificationResult({ taskId: objectId, answer, status, confidence, source: 'checkin' });
+  const completedAt = new Date();
+  const goal = await db.collection('goals').findOne({ _id: task.goalId });
+  if (!goal) {
+    const err = new Error('Active goal not found');
+    err.status = 404;
+    throw err;
+  }
+
+  await db.collection('tasks').updateOne(
+    { _id: objectId },
+    {
+      $set: {
+        status: 'completed',
+        completedAt,
+        startedAt: task.startedAt || null,
+      },
+    }
+  );
+
+  if (goal.activeTaskId && goal.activeTaskId.toString && goal.activeTaskId.toString() === objectId.toString()) {
+    await db.collection('goals').updateOne(
+      { _id: goal._id },
+      { $set: { activeTaskId: null, activeTaskStartedAt: null } }
+    );
+  }
+
+  const isLowScore = (evaluation.completionScore || 0) < 60;
+  const penaltyDays = isLowScore ? 1 : 0;
+
+  if (penaltyDays > 0) {
+    await shiftPendingTasks(goal._id, task.dueDate, penaltyDays, objectId);
+    await db.collection('goals').updateOne(
+      { _id: goal._id },
+      {
+        $set: {
+          delayDays: (goal.delayDays || 0) + penaltyDays,
+          targetDate: formatDate(addDays(new Date(goal.targetDate || task.dueDate || new Date()), penaltyDays)),
+        },
+      }
+    );
+
+    await db.collection('tasks').insertOne({
+      goalId: goal._id,
+      title: `Revision: ${task.title}`,
+      description: `Review the concepts from ${task.title} and close the gaps noted in the check-in.`,
+      durationMinutes: 30,
+      priority: 'high',
+      status: 'pending',
+      dueDate: formatDate(addDays(new Date(task.dueDate || completedAt), 1)),
+      dayIndex: (task.dayIndex || 0) + 1,
+      createdAt: new Date(),
+    });
+  }
+
+  const completed = await db.collection('tasks').countDocuments({
+    goalId: goal._id,
+    status: 'completed',
+  });
+  const total = await db.collection('tasks').countDocuments({ goalId: goal._id });
+  const progress = total > 0 ? Math.round((completed / total) * 100) : 0;
+  const confidence = Math.max(
+    0,
+    Math.min(100, Math.round((goal.confidence + evaluation.confidence) / 2))
+  );
+
+  await db.collection('goals').updateOne(
+    { _id: goal._id },
+    {
+      $set: {
+        progress,
+        confidence,
+      },
+    }
+  );
+
+  await db.collection('checkins').insertOne({
+    taskId: objectId,
+    answer: JSON.stringify(answers || { answer }),
+    status: evaluation.status,
+    confidence: evaluation.confidence,
+    completionScore: evaluation.completionScore,
+    focusRating: evaluation.focusRating,
+    productivityRating: evaluation.productivityRating,
+    confidenceRating: evaluation.confidenceRating,
+    summary: evaluation.summary,
+    feedback: evaluation.feedback,
+    suggestions: evaluation.suggestions,
+    source: 'checkin',
+    createdAt: completedAt,
+  });
+
+  return {
+    status: evaluation.status,
+    confidence: evaluation.confidence,
+    completionScore: evaluation.completionScore,
+    focusRating: evaluation.focusRating,
+    productivityRating: evaluation.productivityRating,
+    confidenceRating: evaluation.confidenceRating,
+    summary: evaluation.summary,
+    feedback: evaluation.feedback,
+    suggestions: evaluation.suggestions,
+  };
 }
 
 module.exports = {
   saveGoal,
   getDashboard,
   recalculate,
+  activateTask,
   submitCheckin,
   getTasks,
   getGoalDetails,

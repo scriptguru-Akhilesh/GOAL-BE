@@ -32,7 +32,8 @@ async function startInterview({ taskId }) {
   });
 
   if (existing) {
-    const lastQuestion = existing.messages.find((m) => m.role === 'assistant');
+    const assistantMessages = existing.messages.filter((m) => m.role === 'assistant');
+    const lastQuestion = assistantMessages[assistantMessages.length - 1];
     return {
       interviewId: existing._id.toString(),
       question: lastQuestion?.content || 'Walk me through exactly what you did for this task.',
@@ -50,7 +51,7 @@ async function startInterview({ taskId }) {
     taskTitle: task.title,
     goalTitle,
     messages: [{ role: 'assistant', content: question }],
-    step: 1,
+    step: 0,
     maxSteps: MAX_STEPS,
     status: 'active',
     createdAt: new Date(),
@@ -81,7 +82,7 @@ async function respondInterview({ interviewId, answer }) {
   }
 
   const messages = [...interview.messages, { role: 'user', content: answer }];
-  const nextStep = interview.step + 1;
+  const nextStep = (Number(interview.step) || 0) + 1;
 
   const aiResult = await continueInterview({
     taskTitle: interview.taskTitle,

@@ -7,6 +7,7 @@ const {
   saveGoal,
   getDashboard,
   recalculate,
+  activateTask,
   submitCheckin,
   getTasks,
   getGoalDetails,
@@ -126,12 +127,23 @@ app.post('/api/interview/respond', async (req, res) => {
 
 app.post('/api/checkin', async (req, res) => {
   try {
-    const { taskId, answer } = req.body;
-    const result = await submitCheckin({ taskId, answer, evaluateCheckin });
+    const { taskId, answer, answers } = req.body;
+    const result = await submitCheckin({ taskId, answer, answers, evaluateCheckin });
     res.json(result);
   } catch (err) {
     logServerError(err, req);
     res.status(err.status || 500).json({ error: err.message || 'Checkin failed' });
+  }
+});
+
+app.post('/api/tasks/activate', async (req, res) => {
+  try {
+    const { taskId } = req.body;
+    const result = await activateTask({ taskId });
+    res.json(result);
+  } catch (err) {
+    logServerError(err, req);
+    res.status(err.status || 500).json({ error: err.message || 'Failed to activate task' });
   }
 });
 

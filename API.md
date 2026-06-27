@@ -583,7 +583,7 @@ Update timeline and stats after a day ends. Pass task IDs completed or missed to
   "delayDays": 0,
   "newETA": "2026-10-13",
   "confidence": 88,
-  "message": "Great work! Completed 2 tasks"
+  "message": "Great work!"
 }
 ```
 
