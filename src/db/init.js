@@ -1,4 +1,4 @@
-require('dotenv').config();
+require('dotenv').config({ override: true });
 const { connect, close, getDb } = require('./mongo');
 
 const SEED_SOLVERS = [

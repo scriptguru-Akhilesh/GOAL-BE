@@ -55,6 +55,13 @@ async function getUserProfile() {
   };
 }
 
+async function getRole() {
+  const user = await getDefaultUser();
+  return {
+    role: user.role,
+  };
+}
+
 async function switchRole({ role }) {
   if (![ROLES.GOAL_CREATOR, ROLES.DOUBT_SOLVER].includes(role)) {
     const err = new Error('Invalid role. Use goal_creator or doubt_solver');
@@ -370,6 +377,7 @@ async function completeMeeting({ meetingId }) {
 module.exports = {
   ROLES,
   getUserProfile,
+  getRole,
   switchRole,
   getMentorshipPackages,
   buyMentorship,

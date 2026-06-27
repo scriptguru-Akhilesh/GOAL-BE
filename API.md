@@ -1240,6 +1240,8 @@ await fetch(`${API}/tasks/skip`, {
 
 | Method | Path | Description |
 |--------|------|-------------|
+| GET | `/role` | Current role only |
+| POST | `/role` | Switch role (simple demo flow) |
 | GET | `/user/profile` | Current user role + mentorship balance |
 | POST | `/user/role` | Switch role (demo toggle) |
 | GET | `/mentorship/packages` | Hour packages to buy |
@@ -1321,6 +1323,18 @@ or
 
 ```json
 { "error": "Invalid role. Use goal_creator or doubt_solver" }
+```
+
+## NEW — GET `/role`
+
+Tiny role-only endpoint for hackathon flows.
+
+### Success response `200`
+
+```json
+{
+  "role": "goal_creator"
+}
 ```
 
 ---
